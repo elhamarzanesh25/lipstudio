@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lip Studio</title>
+<style>
+  :root{--bg:#faf7f5;--fg:#2a2226;--muted:#7d7278;--card:#fff;--line:#e8dfe0;--accent:#b3204d}
+  @media(prefers-color-scheme:dark){:root{--bg:#1b1719;--fg:#f3eaec;--muted:#a99da3;--card:#262023;--line:#3a3135;--accent:#ff6b93}}
+  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif}
+  main{max-width:960px;margin:0 auto;padding:24px 16px 48px}
+  h1{font-size:1.6rem;margin:0 0 4px}p.sub{color:var(--muted);margin:0 0 20px}
+  .grid{display:grid;grid-template-columns:340px 1fr;gap:20px}@media(max-width:800px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+  label.t{display:block;font-weight:600;margin:14px 0 6px}label.t:first-child{margin-top:0}
+  input[type=file]{width:100%}
+  .colorrow{display:flex;gap:10px;align-items:center}
+  input[type=color]{width:48px;height:40px;border:1px solid var(--line);border-radius:8px;padding:2px;background:none}
+  input[type=text]{flex:1;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+  .finishes{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .finishes input{position:absolute;opacity:0}
+  .finishes label{border:1px solid var(--line);border-radius:10px;padding:8px 10px;cursor:pointer;display:block}
+  .finishes label b{display:block}.finishes label span{font-size:.8rem;color:var(--muted)}
+  .finishes input:checked+label{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent) inset}
+  .finishes input:focus-visible+label{outline:2px solid var(--accent)}
+  .finishes div{position:relative}
+  button{margin-top:18px;width:100%;padding:12px;border:0;border-radius:10px;background:var(--accent);color:#fff;font:600 1rem inherit;cursor:pointer}
+  button:disabled{opacity:.6}
+  .err{color:#d33;font-size:.9rem;margin:6px 0 0}
+  .imgs{display:grid;grid-template-columns:1fr 1fr;gap:12px}.imgs figure{margin:0}
+  .imgs img{width:100%;border-radius:10px;display:block}figcaption{color:var(--muted);font-size:.85rem;margin-top:4px}
+  .empty{color:var(--muted);text-align:center;padding:60px 10px}
+  a.dl{display:inline-block;margin-top:12px;color:var(--accent);font-weight:600}
+</style>
+</head>
+<body>
+<main>
+  <h1>Lip Studio</h1>
+  <nav><a href="{% url 'tryon:index' %}" aria-current="page">Photo</a><a href="{% url 'tryon:live' %}">Live camera</a></nav>
+  <p class="sub">Upload a photo, pick a colour and a finish. Lip texture is preserved.</p>
+  <div class="grid">
+    <form class="card" id="f" onsubmit="return false">
+      {% csrf_token %}
+      <label class="t" for="id_image">Photo</label>
+      <input type="file" name="image" id="id_image" accept="image/*">
+
+      <label class="t" for="hex">Colour</label>
+      <div class="colorrow">
+        <input type="color" id="pick" value="#FF0000" aria-label="Pick colour">
+        <input type="text" name="color" id="hex" value="#FF0000" maxlength="7" pattern="#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})">
+      </div>
+
+      <label class="t">Finish</label>
+      <div class="finishes">
+        {% for key, name, desc in finishes %}
+        <div><input type="radio" name="finish" id="fin_{{ key }}" value="{{ key }}" {% if key == "matte" %}checked{% endif %}>
+          <label for="fin_{{ key }}"><b>{{ name }}</b><span>{{ desc }}</span></label></div>
+        {% endfor %}
+      </div>
+      <p class="err" id="err" role="alert"></p>
+    </form>
+
+    <section class="card" aria-live="polite">
+      <div class="empty" id="empty">Choose a photo to start.</div>
+      <div id="out" hidden>
+        <div class="imgs">
+          <figure><img id="img-o" alt="Original"><figcaption>Original</figcaption></figure>
+          <figure><img id="img-r" alt="Result"><figcaption id="cap-r">Result</figcaption></figure>
+        </div>
+        <a class="dl" id="dl" href="#" download="lip-result.jpg">Download result</a>
+      </div>
+    </section>
+  </div>
+</main>
+<script>
+  const $=id=>document.getElementById(id), csrf=document.querySelector('[name=csrfmiddlewaretoken]').value;
+  const pick=$('pick'),hex=$('hex'),err=$('err');
+  let token=null, seq=0, timer=null;
+
+  const post=(url,body)=>fetch(url,{method:'POST',body,headers:{'X-CSRFToken':csrf}});
+  const msg=j=>{const e=j.errors||{};for(const k in e)return e[k][0].message;return 'Something went wrong.'};
+  const finish=()=>document.querySelector('input[name=finish]:checked').value;
+  const validHex=v=>/^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.test(v);
+
+  // 1) upload ONCE
+  $('id_image').addEventListener('change',async e=>{
+    const f=e.target.files[0]; if(!f)return;
+    err.textContent=''; $('empty').textContent='Analysing photo…'; $('empty').hidden=false; $('out').hidden=true; token=null;
+    const fd=new FormData(); fd.append('image',f);
+    const r=await post('/api/upload/',fd), j=await r.json();
+    if(!r.ok){err.textContent=msg(j);$('empty').textContent='Choose a photo to start.';return}
+    token=j.token; $('img-o').src=j.original; $('empty').hidden=true; $('out').hidden=false;
+    apply();
+  });
+
+  // 2) apply MANY times (no re-upload)
+  async function apply(){
+    if(!token||!validHex(hex.value))return;
+    const my=++seq; $('cap-r').textContent='Result…';
+    const fd=new FormData(); fd.append('token',token); fd.append('color',hex.value); fd.append('finish',finish());
+    const r=await post('/api/apply/',fd), j=await r.json();
+    if(my!==seq)return;                                   // a newer request is already running
+    if(!r.ok){err.textContent=msg(j); if(r.status===410){token=null;$('out').hidden=true;$('empty').hidden=false;$('empty').textContent='Choose a photo to start.'} return}
+    err.textContent=''; $('img-r').src=j.result; $('dl').href=j.result; $('cap-r').textContent='Result';
+  }
+  const later=()=>{clearTimeout(timer);timer=setTimeout(apply,120)};
+
+  pick.addEventListener('input',()=>{hex.value=pick.value.toUpperCase();later()});
+  hex.addEventListener('input',()=>{const v=hex.value.startsWith('#')?hex.value:'#'+hex.value;if(/^#[0-9a-f]{6}$/i.test(v))pick.value=v;later()});
+  document.querySelectorAll('input[name=finish]').forEach(r=>r.addEventListener('change',apply));
+</script>
+</body>
+</html>

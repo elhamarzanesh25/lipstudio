@@ -1,0 +1,4 @@
+Django>=5.0
+mediapipe>=0.10.14
+opencv-python-headless
+numpy

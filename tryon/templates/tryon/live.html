@@ -1,0 +1,82 @@
+{% load static %}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lip Studio - Live</title>
+<style>
+  :root{--bg:#faf7f5;--fg:#2a2226;--muted:#7d7278;--card:#fff;--line:#e8dfe0;--accent:#b3204d}
+  @media(prefers-color-scheme:dark){:root{--bg:#1b1719;--fg:#f3eaec;--muted:#a99da3;--card:#262023;--line:#3a3135;--accent:#ff6b93}}
+  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif}
+  main{max-width:960px;margin:0 auto;padding:24px 16px 48px}
+  h1{font-size:1.6rem;margin:0 0 4px}p.sub{color:var(--muted);margin:0 0 20px}
+  .grid{display:grid;grid-template-columns:340px 1fr;gap:20px}@media(max-width:800px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+  label.t{display:block;font-weight:600;margin:14px 0 6px}label.t:first-child{margin-top:0}
+  input[type=file]{width:100%}
+  .colorrow{display:flex;gap:10px;align-items:center}
+  input[type=color]{width:48px;height:40px;border:1px solid var(--line);border-radius:8px;padding:2px;background:none}
+  input[type=text]{flex:1;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+  .finishes{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .finishes input{position:absolute;opacity:0}
+  .finishes label{border:1px solid var(--line);border-radius:10px;padding:8px 10px;cursor:pointer;display:block}
+  .finishes label b{display:block}.finishes label span{font-size:.8rem;color:var(--muted)}
+  .finishes input:checked+label{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent) inset}
+  .finishes input:focus-visible+label{outline:2px solid var(--accent)}
+  .finishes div{position:relative}
+  button{margin-top:18px;width:100%;padding:12px;border:0;border-radius:10px;background:var(--accent);color:#fff;font:600 1rem inherit;cursor:pointer}
+  button:disabled{opacity:.6}
+  .err{color:#d33;font-size:.9rem;margin:6px 0 0}
+  .imgs{display:grid;grid-template-columns:1fr 1fr;gap:12px}.imgs figure{margin:0}
+  .imgs img{width:100%;border-radius:10px;display:block}figcaption{color:var(--muted);font-size:.85rem;margin-top:4px}
+  .empty{color:var(--muted);text-align:center;padding:60px 10px}
+  a.dl{display:inline-block;margin-top:12px;color:var(--accent);font-weight:600}
+
+  nav{display:flex;gap:16px;margin:0 0 14px}nav a{color:var(--muted);text-decoration:none;font-weight:600;padding-bottom:2px}
+  nav a[aria-current]{color:var(--accent);border-bottom:2px solid var(--accent)}
+  .stage{position:relative}.stage canvas{width:100%;height:auto;border-radius:10px;display:block;transform:scaleX(-1)}
+  #video{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+  .row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.row button{margin:0;width:auto;flex:1;min-width:120px}
+  button.sec{background:var(--card);color:var(--fg);border:1px solid var(--line)}
+  #status{color:var(--muted);font-size:.85rem;margin-top:8px;min-height:1.3em}
+  button[hidden],.stage[hidden],.empty[hidden]{display:none}
+</style>
+</head>
+<body>
+<main id="app" data-wasm="{% static 'tryon/vendor/tasks-vision' %}" data-model="{% static 'tryon/models/face_landmarker.task' %}">
+  <h1>Lip Studio</h1>
+  <nav><a href="{% url 'tryon:index' %}">Photo</a><a href="{% url 'tryon:live' %}" aria-current="page">Live camera</a></nav>
+  <p class="sub">Live try-on on your camera. Everything runs in your browser; no video is uploaded.</p>
+  <div class="grid">
+    <div class="card">
+      <label class="t" for="hex">Colour</label>
+      <div class="colorrow">
+        <input type="color" id="pick" value="#FF0000" aria-label="Pick colour">
+        <input type="text" id="hex" value="#FF0000" maxlength="7">
+      </div>
+      <label class="t">Finish</label>
+      <div class="finishes">
+        {% for key, name, desc in finishes %}
+        <div><input type="radio" name="finish" id="fin_{{ key }}" value="{{ key }}" {% if key == "matte" %}checked{% endif %}>
+          <label for="fin_{{ key }}"><b>{{ name }}</b><span>{{ desc }}</span></label></div>
+        {% endfor %}
+      </div>
+      <div class="row">
+        <button type="button" id="start">Start camera</button>
+        <button type="button" id="stop" class="sec" hidden>Stop</button>
+        <button type="button" id="snap" class="sec" hidden>Snapshot</button>
+      </div>
+      <p class="err" id="err" role="alert"></p>
+      <div id="status" aria-live="polite"></div>
+    </div>
+    <section class="card">
+      <div class="empty" id="empty">Press "Start camera" to begin.</div>
+      <div class="stage" id="stage" hidden><canvas id="view"></canvas></div>
+      <video id="video" playsinline muted></video>
+    </section>
+  </div>
+</main>
+<script src="{% static 'tryon/lipfx.js' %}"></script>
+<script type="module" src="{% static 'tryon/live.js' %}"></script>
+</body>
+</html>
