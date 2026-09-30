@@ -3,7 +3,10 @@ import { FaceLandmarker, FilesetResolver } from "./vendor/tasks-vision/vision_bu
 
 const cfg = document.getElementById("app").dataset;
 const $ = id => document.getElementById(id);
-const ALPHA = 0.5;                                   // same rgba alpha as the photo mode
+const ALPHA = 0.6;                                   // opacity of the paint layer (same as LIP_ALPHA in settings.py)
+const REFINE_EDGES = true;                           // snap the mask edge to the real lip border (auto-disabled when colours don't separate)
+const REFINE_BAND = 0.05;                            // max edge move, as a fraction of lip width
+const EURO = { minCutoff: 1.2, beta: 0.1 };          // landmark filter: lower minCutoff = steadier, higher beta = less lag
 const OUTER = [61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146];
 const INNER = [78,191,80,81,82,13,312,311,310,415,308,324,318,402,317,14,87,178,88,95];
 
@@ -11,7 +14,7 @@ const video = $("video"), view = $("view"), vctx = view.getContext("2d");
 const roiC = document.createElement("canvas"), roiX = roiC.getContext("2d", { willReadFrequently: true });
 const mskC = document.createElement("canvas"), mskX = mskC.getContext("2d", { willReadFrequently: true });
 const noise = LipFX.makeNoise(42), fxState = {};
-let landmarker = null, stream = null, running = false, lastT = -1, smooth = null, lastTs = 0;
+let landmarker = null, stream = null, running = false, lastT = -1, filt = null, lastTs = 0;
 let fps = 0, tick0 = performance.now(), frames = 0, missing = 0;
 
 const status = t => { $("status").textContent = t; };
@@ -40,7 +43,7 @@ async function start() {
     stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
     video.srcObject = stream; await video.play();
     view.width = video.videoWidth; view.height = video.videoHeight;
-    running = true; smooth = null; lastTs = 0; $("stage").hidden = false; $("empty").hidden = true;
+    running = true; filt = null; lastTs = 0; $("stage").hidden = false; $("empty").hidden = true;
     $("start").hidden = true; $("stop").hidden = false; $("snap").hidden = false;
     requestAnimationFrame(loop);
   } catch (e) {
@@ -61,41 +64,47 @@ function loop() {
     const ts = Math.max(performance.now(), lastTs + 1); lastTs = ts;         // timestamps must increase
     const res = landmarker.detectForVideo(video, ts);
     vctx.drawImage(video, 0, 0);
-    if (res.faceLandmarks.length) { missing = 0; processLips(res.faceLandmarks[0]); status(`${fps.toFixed(0)} fps`); }
-    else if (++missing > 5) { smooth = null; status("No face detected"); }
+    if (res.faceLandmarks.length) { missing = 0; processLips(res.faceLandmarks[0], ts / 1000); status(`${fps.toFixed(0)} fps`); }
+    else if (++missing > 5) { filt = null; delete fxState.mean; status("No face detected"); }
     frames++; const now = performance.now();
     if (now - tick0 > 500) { fps = frames * 1000 / (now - tick0); frames = 0; tick0 = now; }
   }
   requestAnimationFrame(loop);
 }
 
-function processLips(lm) {
+function processLips(lm, t) {
   const W = view.width, H = view.height, idx = OUTER.concat(INNER);
-  // light temporal smoothing of the landmarks -> less jitter (faster when the lips really move)
-  if (!smooth) smooth = idx.map(i => [lm[i].x * W, lm[i].y * H]);
-  else idx.forEach((i, k) => {
-    const nx = lm[i].x * W, ny = lm[i].y * H, d = Math.hypot(nx - smooth[k][0], ny - smooth[k][1]);
-    const a = Math.min(1, 0.45 + d / (0.02 * W));
-    smooth[k][0] += a * (nx - smooth[k][0]); smooth[k][1] += a * (ny - smooth[k][1]);
-  });
-  const outer = smooth.slice(0, OUTER.length), inner = smooth.slice(OUTER.length);
-  const xs = outer.map(p => p[0]), ys = outer.map(p => p[1]);
+  // 1) 3D landmarks (px; z on the same scale as x), stabilised with a One Euro filter per coordinate
+  if (!filt) filt = idx.map(() => [0, 1, 2].map(() => new LipFX.OneEuro(EURO.minCutoff, EURO.beta)));
+  const P = idx.map((i, k) => [lm[i].x * W, lm[i].y * H, lm[i].z * W].map((v, c) => filt[k][c].filter(v, t)));
+  const outerLoop = LipFX.lipLoop(P.slice(0, OUTER.length)), innerLoop = LipFX.lipLoop(P.slice(OUTER.length));
+
+  // 2) ROI around the lips
+  const xs = outerLoop.map(p => p[0]), ys = outerLoop.map(p => p[1]);
   const lipW = Math.max(...xs) - Math.min(...xs), mg = Math.max(8, Math.round(lipW * 0.14));
   const x0 = Math.max(0, Math.floor(Math.min(...xs)) - mg), y0 = Math.max(0, Math.floor(Math.min(...ys)) - mg);
   const x1 = Math.min(W, Math.ceil(Math.max(...xs)) + mg), y1 = Math.min(H, Math.ceil(Math.max(...ys)) + mg);
   const w = x1 - x0, h = y1 - y0; if (w < 8 || h < 8) return;
-
-  // mask: outer lip polygon minus mouth opening, anti-aliased by the canvas, then feathered
   if (mskC.width !== w || mskC.height !== h) { mskC.width = w; mskC.height = h; roiC.width = w; roiC.height = h; }
-  mskX.clearRect(0, 0, w, h); mskX.globalCompositeOperation = "source-over"; mskX.fillStyle = "#fff";
-  const path = pts => { mskX.beginPath(); pts.forEach(([x, y], i) => i ? mskX.lineTo(x - x0, y - y0) : mskX.moveTo(x - x0, y - y0)); mskX.closePath(); mskX.fill(); };
-  path(outer); mskX.globalCompositeOperation = "destination-out"; path(inner);
-  const md = mskX.getImageData(0, 0, w, h).data, m0 = new Float32Array(w * h);
-  for (let i = 0; i < m0.length; i++) m0[i] = md[4 * i + 3] / 255;
-  const mask = LipFX.gauss(m0, w, h, Math.max(1, lipW * 0.02));
 
-  roiX.drawImage(video, x0, y0, w, h, 0, 0, w, h);                        // same frame as the full view
+  // 3) anti-aliased fills of the smooth outer outline and of the mouth opening
+  const raster = loop => {
+    mskX.clearRect(0, 0, w, h); mskX.fillStyle = "#fff"; mskX.beginPath();
+    loop.forEach(([x, y], i) => i ? mskX.lineTo(x - x0, y - y0) : mskX.moveTo(x - x0, y - y0));
+    mskX.closePath(); mskX.fill();
+    const d = mskX.getImageData(0, 0, w, h).data, m = new Float32Array(w * h);
+    for (let i = 0; i < m.length; i++) m[i] = d[4 * i + 3] / 255;
+    return m;
+  };
+  const mOuter = raster(outerLoop), mInner = raster(innerLoop);
+
+  // 4) same-frame pixels, then the final mask: edge snapped to the real lip border + depth-aware fade
+  roiX.drawImage(video, x0, y0, w, h, 0, 0, w, h);
   const img = roiX.getImageData(0, 0, w, h);
+  const mask = LipFX.finishMask(mOuter, mInner, img.data, w, h,
+    { lipW, refine: REFINE_EDGES, band: REFINE_BAND, fit: LipFX.fitSurface(P, lipW), ox: x0, oy: y0 });
+
+  // 5) colour + finish
   LipFX.render(img.data, w, h, mask, { color, alpha: ALPHA, finish: finish(), lipW, noise, ox: x0, oy: y0, state: fxState });
   roiX.putImageData(img, 0, 0);
   vctx.drawImage(roiC, x0, y0);

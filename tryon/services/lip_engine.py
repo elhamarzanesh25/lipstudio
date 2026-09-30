@@ -1,9 +1,11 @@
 """
 Lip colouring engine: MediaPipe FaceLandmarker (.task) -> lip mask -> finish.
 
-Every finish starts from the same RGBA composite  out = img*(1-a*m) + color*(a*m)
-(a = settings.LIP_ALPHA = 0.5) and then adds its own look on top.  Nothing
-replaces pixels, so the natural lip texture always remains underneath.
+The paint colour is a mix of the lipstick and the user's own lip colour (LIP_MIX), and is
+lightened/darkened per pixel by the lip's own texture (see _shade), not by the room's lighting.
+Every finish then lays that paint down with the same RGBA composite
+out = img*(1-a*m) + paint*(a*m)  (a = settings.LIP_ALPHA) and adds its own look on top.
+Nothing replaces pixels outright, so the natural lip texture always remains underneath.
 """
 import threading
 from dataclasses import dataclass
@@ -74,10 +76,10 @@ def build_lip_mask(lms, shape):
 class Ctx:
     img: np.ndarray      # float32 BGR 0..255
     mask: np.ndarray     # float32 0..1
-    color: np.ndarray    # float32 (1,1,3) BGR
+    color: np.ndarray    # float32 (1,1,3) BGR - the paint colour (already mixed, see LIP_MIX)
     alpha: float
     depth: np.ndarray    # 0 at lip edge -> 1 at lip centre
-    luma: np.ndarray     # 0..1
+    shade: np.ndarray    # ~0.6..1.4 local texture lightness (see _shade); 1.0 = neutral
     lip_w: float
     rng: np.random.Generator
 
@@ -125,56 +127,69 @@ def _add_white(out, amount_map):
 # --------------------------------------------------------------------------
 # Finishes
 # --------------------------------------------------------------------------
-def _light_map(ctx):
-    """
-    Smooth 0..1 map of how much light each lip pixel receives.
-    0 = shadow, 1 = the brightest spot of the lips.  Heavily smoothed so it follows the
-    broad lighting of the lips, not the fine cracks, and shaped so that only areas
-    close to the maximum get close to 1.
-    """
-    lum = _blur(ctx.luma, max(1.5, ctx.lip_w * 0.03))
-    sel = ctx.mask > 0.5
-    lo, hi = np.percentile(lum[sel], [10, 99.7])
-    t = np.clip((lum - lo) / max(hi - lo, 1e-3), 0, 1)
-    t = t * t * (3 - 2 * t)                                       # smoothstep
-    return t ** 2.2                                               # keep white for the top end only
+# Paint colour = LIP_MIX * lipstick + (1 - LIP_MIX) * the user's own average lip colour.
+# This is a real colour mix (not just the alpha compositing below), so the lipstick's hue is
+# already warmed/cooled by the person's own pigment before it ever touches the photo.
+LIP_MIX = 0.7
+
+# How strongly the LIP'S OWN TEXTURE (not the room's lighting - see _shade below) lightens a
+# naturally-raised/highlighted spot, and darkens a naturally-recessed one, for each finish.
+TONE = {
+    "matte":  (0.35, 0.35),   # (light_gain, dark_gain)
+    "satin":  (0.50, 0.30),
+    "glossy": (0.65, 0.25),
+    "velvet": (0.25, 0.45),
+}
+# Glossy only: extra whitening on the very brightest texture ridges - the "wet" specular look.
+GLOSSY_SPECULAR = 0.35
 
 
-# How much of the light-dependent white each finish gets (0 = none, 1 = full).
-LIGHT_MATTE = 0.5
-LIGHT_GLOSSY = 1.0
-LIGHT_VELVET = 0.6
+def _tone(ctx):
+    """
+    Split ctx.shade (0.6..1.4, see _shade()) into a highlight amount and a recess amount, both 0..1.
+    """
+    t = np.clip((ctx.shade - 1.0) / 0.4, 0, 1)   # 0..1 : natural highlight (raised / lit texture)
+    d = np.clip((1.0 - ctx.shade) / 0.4, 0, 1)   # 0..1 : natural recess    (crease / seam / corner)
+    return t, d
 
 
-def _tint_by_light(ctx, strength=1.0):
+def _tinted(ctx, light_gain, dark_gain, spec_gain=0.0):
     """
-    Total tint weight stays constant (alpha * mask) everywhere, so there is no visible
-    step in overall strength.  Only its split changes with the light:
-        s = 0 (shadow)     -> all of it is lip colour
-        s = 1 (max light)  -> all of it is white
-        out = img*(1-w) + w*((1-s)*color + s*white)
+    Paint the lips at a constant opacity (alpha * mask) everywhere, but let the LIP'S OWN
+    TEXTURE brighten or darken the paint itself before it's laid down:
+        highlight (t=1) -> paint pushed towards white by `light_gain`
+        recess    (d=1) -> paint pulled towards black by `dark_gain`
+    `ctx.shade` is a *local* ratio (a small blur divided by a wider blur of the same pixels), so a
+    global lighting gradient across the face cancels out of it almost completely - only the lip's
+    own raised/recessed geometry survives.  See _shade() for the measurement itself.
     """
-    s = (_light_map(ctx) * strength)[..., None]
+    t, d = _tone(ctx)
+    tint = ctx.color + (t * light_gain)[..., None] * (255.0 - ctx.color)
+    if spec_gain:
+        tint = tint + ((t ** 2) * spec_gain)[..., None] * (255.0 - tint)
+    tint = tint * (1 - d * dark_gain)[..., None]
     w = (ctx.mask * ctx.alpha)[..., None]
-    tint = (1 - s) * ctx.color + s * 255.0
     return ctx.img * (1 - w) + tint * w
 
 
 def matte(ctx):
-    return _tint_by_light(ctx, LIGHT_MATTE)
+    light_gain, dark_gain = TONE["matte"]
+    return _tinted(ctx, light_gain, dark_gain)
 
 
 def glossy(ctx):
-    return _soften(ctx, _tint_by_light(ctx, LIGHT_GLOSSY), 0.35)     # softening fills fine cracks                    # fills fine cracks, wet look
+    light_gain, dark_gain = TONE["glossy"]
+    return _soften(ctx, _tinted(ctx, light_gain, dark_gain, GLOSSY_SPECULAR), 0.35)   # softening fills fine cracks
 
 
 def satin(ctx):
-    out = _soften(ctx, _composite(ctx), 0.2)
-    return _add_white(out, _highlights(ctx, 0.35) + _band(ctx, 0.55, 0.35) * 0.10)
+    light_gain, dark_gain = TONE["satin"]
+    return _soften(ctx, _tinted(ctx, light_gain, dark_gain), 0.2)
 
 
 def velvet(ctx):
-    out = _soften(ctx, _tint_by_light(ctx, LIGHT_VELVET), 0.5)
+    light_gain, dark_gain = TONE["velvet"]
+    out = _soften(ctx, _tinted(ctx, light_gain, dark_gain), 0.5)
     grain = _blur(ctx.rng.normal(0, 1, ctx.mask.shape).astype(np.float32), 0.7) * 7.0
     out = out + (grain * ctx.mask)[..., None]                          # fine powdery grain
     edge = (1 - ctx.depth) ** 2                                         # soft darker rim
@@ -211,14 +226,44 @@ def decode_image(data: bytes):
     return img
 
 
+def _shade(luma, mask):
+    """
+    Local texture lightness, ~0.6 (deep recess) .. 1.0 (neutral) .. 1.4 (natural highlight ridge).
+    It is the ratio of a SMALL blur of the lips' own luma to a WIDER blur of the same pixels, both
+    masked so skin and teeth can't leak in.  Dividing a small blur by a wide one is the classic
+    "unsharp mask" trick: any large, slowly-varying pattern - such as one side of the face catching
+    more room light than the other - shows up almost identically in both blurs and cancels out of
+    the ratio.  What survives is the texture that changes over a distance shorter than the wide
+    blur: the vermillion border, the cupid's bow ridge, the seam between the lips, the corners.
+    That is "the brightness of the lip's own texture", independent of the room's lighting.
+    """
+    lip_w = float(np.ptp(np.where(mask > 0.5)[1])) if (mask > 0.5).any() else 1.0
+
+    def masked_blur(sigma):
+        k = int(sigma * 4) | 1
+        num = cv2.GaussianBlur(luma * mask, (k, k), sigma)
+        den = cv2.GaussianBlur(mask, (k, k), sigma)
+        return num / np.maximum(den, 1e-3), den
+
+    fine, _ = masked_blur(0.8)
+    mid, den = masked_blur(max(2.0, lip_w * 0.06))
+    shade = np.clip(fine / np.maximum(mid, 0.05), 0.6, 1.4)
+    # Fade to neutral (1.0) wherever the wide blur barely overlaps the mask (right at its edge),
+    # so the mask boundary itself doesn't get mistaken for a highlight/recess.
+    conf = np.clip((den - 0.05) / 0.25, 0, 1)
+    conf = conf * conf * (3 - 2 * conf)
+    return 1.0 + (shade - 1.0) * conf
+
+
 @dataclass
 class Prepared:
     """Everything that depends only on the photo (computed ONCE per upload)."""
-    img: np.ndarray      # uint8 BGR
+    img: np.ndarray       # uint8 BGR
     mask: np.ndarray
     depth: np.ndarray
-    luma: np.ndarray
     lip_w: float
+    lip_mean: np.ndarray  # the user's own average lip colour (BGR, float32)
+    shade: np.ndarray     # local texture lightness, see _shade()
 
 
 def prepare_image(img_bgr) -> Prepared:
@@ -226,10 +271,11 @@ def prepare_image(img_bgr) -> Prepared:
     lms = detect_landmarks(img_bgr)
     mask = build_lip_mask(lms, img_bgr.shape)
     xs = [lms[i].x * img_bgr.shape[1] for i in OUTER_LIP]
+    luma = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
     return Prepared(
-        img=img_bgr, mask=mask, depth=_depth(mask),
-        luma=cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0,
-        lip_w=float(np.ptp(xs)),
+        img=img_bgr, mask=mask, depth=_depth(mask), lip_w=float(np.ptp(xs)),
+        lip_mean=img_bgr[mask > 0.5].mean(axis=0).astype(np.float32),
+        shade=_shade(luma, mask),
     )
 
 
@@ -237,11 +283,12 @@ def render(prep: Prepared, hex_color, finish="matte", alpha=None):
     """Fast part: colour + finish.  Call as many times as the user changes settings."""
     if finish not in FINISHES:
         raise ValueError(f"Unknown finish: {finish}")
+    lipstick = np.array(hex_to_rgb(hex_color)[::-1], np.float32)
+    paint = LIP_MIX * lipstick + (1 - LIP_MIX) * prep.lip_mean         # lipstick coloured by the user's own lips
     ctx = Ctx(
-        img=prep.img.astype(np.float32), mask=prep.mask,
-        color=np.array(hex_to_rgb(hex_color)[::-1], np.float32).reshape(1, 1, 3),
+        img=prep.img.astype(np.float32), mask=prep.mask, color=paint.reshape(1, 1, 3),
         alpha=settings.LIP_ALPHA if alpha is None else alpha,
-        depth=prep.depth, luma=prep.luma, lip_w=prep.lip_w,
+        depth=prep.depth, shade=prep.shade, lip_w=prep.lip_w,
         rng=np.random.default_rng(42),
     )
     return np.clip(FINISHES[finish][2](ctx), 0, 255).astype(np.uint8)

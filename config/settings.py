@@ -99,7 +99,7 @@ MAILERS = {
 
 # --- Lip try-on ---
 FACE_LANDMARKER_MODEL = BASE_DIR / 'models' / 'face_landmarker.task'
-LIP_ALPHA = 0.5          # rgba alpha of the lip colour
+LIP_ALPHA = 0.6          # rgba alpha of the lip colour: 60 % lipstick / 40 % the user's own lips          # rgba alpha of the lip colour
 LIP_MAX_SIDE = 1600      # uploads are downscaled to this max side (px)
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
