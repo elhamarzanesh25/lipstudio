@@ -201,7 +201,6 @@ FINISHES = {
     "matte":    ("Matte",    "Flat, no shine",             matte),
     "glossy":   ("Glossy",   "Wet, high-shine",            glossy),
     "satin":    ("Satin",    "Soft, subtle sheen",         satin),
-    "velvet":   ("Velvet",   "Powdery, soft-focus",        velvet),
 }
 
 

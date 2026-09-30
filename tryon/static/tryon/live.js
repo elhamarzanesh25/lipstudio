@@ -3,7 +3,8 @@ import { FaceLandmarker, FilesetResolver } from "./vendor/tasks-vision/vision_bu
 
 const cfg = document.getElementById("app").dataset;
 const $ = id => document.getElementById(id);
-const ALPHA = 0.6;                                   // opacity of the paint layer (same as LIP_ALPHA in settings.py)
+const ALPHA = 0.85;   
+const CAM = { w: 1920, h: 1080, fps: 30 };            // requested camera resolution (the browser picks the closest one the camera supports)                                // opacity of the paint layer (same as LIP_ALPHA in settings.py)
 const REFINE_EDGES = true;                           // snap the mask edge to the real lip border (auto-disabled when colours don't separate)
 const REFINE_BAND = 0.05;                            // max edge move, as a fraction of lip width
 const EURO = { minCutoff: 1.2, beta: 0.1 };          // landmark filter: lower minCutoff = steadier, higher beta = less lag
@@ -40,7 +41,7 @@ async function start() {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera needs HTTPS (or localhost).");
     await loadModel();
     status("Starting camera…");
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: CAM.w }, height: { ideal: CAM.h }, frameRate: { ideal: CAM.fps } }, audio: false });
     video.srcObject = stream; await video.play();
     view.width = video.videoWidth; view.height = video.videoHeight;
     running = true; filt = null; lastTs = 0; $("stage").hidden = false; $("empty").hidden = true;
@@ -64,8 +65,8 @@ function loop() {
     const ts = Math.max(performance.now(), lastTs + 1); lastTs = ts;         // timestamps must increase
     const res = landmarker.detectForVideo(video, ts);
     vctx.drawImage(video, 0, 0);
-    if (res.faceLandmarks.length) { missing = 0; processLips(res.faceLandmarks[0], ts / 1000); status(`${fps.toFixed(0)} fps`); }
-    else if (++missing > 5) { filt = null; delete fxState.mean; status("No face detected"); }
+    if (res.faceLandmarks.length) { missing = 0; processLips(res.faceLandmarks[0], ts / 1000);     if (res.faceLandmarks.length) { missing = 0; processLips(res.faceLandmarks[0], ts / 1000); status(`${fps.toFixed(0)} fps · ${view.width}×${view.height}`); } }
+        else if (++missing > 5) { filt = null; delete fxState.mean; delete fxState.ref; status("No face detected"); }
     frames++; const now = performance.now();
     if (now - tick0 > 500) { fps = frames * 1000 / (now - tick0); frames = 0; tick0 = now; }
   }
@@ -77,17 +78,20 @@ function processLips(lm, t) {
   // 1) 3D landmarks (px; z on the same scale as x), stabilised with a One Euro filter per coordinate
   if (!filt) filt = idx.map(() => [0, 1, 2].map(() => new LipFX.OneEuro(EURO.minCutoff, EURO.beta)));
   const P = idx.map((i, k) => [lm[i].x * W, lm[i].y * H, lm[i].z * W].map((v, c) => filt[k][c].filter(v, t)));
-  const outerLoop = LipFX.lipLoop(P.slice(0, OUTER.length)), innerLoop = LipFX.lipLoop(P.slice(OUTER.length));
+  const Po = P.slice(0, OUTER.length), Pi = P.slice(OUTER.length);
+  const pxs = Po.map(p => p[0]), lipW = Math.max(...pxs) - Math.min(...pxs);
+  // upper lip, lower lip and the whole outline as three separate smooth closed outlines
+  const parts = LipFX.lipParts(Po, Pi, lipW);
 
   // 2) ROI around the lips
-  const xs = outerLoop.map(p => p[0]), ys = outerLoop.map(p => p[1]);
-  const lipW = Math.max(...xs) - Math.min(...xs), mg = Math.max(8, Math.round(lipW * 0.14));
+  const xs = parts.outer.map(p => p[0]), ys = parts.outer.map(p => p[1]);
+  const mg = Math.max(8, Math.round(lipW * 0.14));
   const x0 = Math.max(0, Math.floor(Math.min(...xs)) - mg), y0 = Math.max(0, Math.floor(Math.min(...ys)) - mg);
   const x1 = Math.min(W, Math.ceil(Math.max(...xs)) + mg), y1 = Math.min(H, Math.ceil(Math.max(...ys)) + mg);
   const w = x1 - x0, h = y1 - y0; if (w < 8 || h < 8) return;
   if (mskC.width !== w || mskC.height !== h) { mskC.width = w; mskC.height = h; roiC.width = w; roiC.height = h; }
 
-  // 3) anti-aliased fills of the smooth outer outline and of the mouth opening
+  // 3) anti-aliased fills: upper lip, lower lip (each on its own) and the whole outline
   const raster = loop => {
     mskX.clearRect(0, 0, w, h); mskX.fillStyle = "#fff"; mskX.beginPath();
     loop.forEach(([x, y], i) => i ? mskX.lineTo(x - x0, y - y0) : mskX.moveTo(x - x0, y - y0));
@@ -96,16 +100,16 @@ function processLips(lm, t) {
     for (let i = 0; i < m.length; i++) m[i] = d[4 * i + 3] / 255;
     return m;
   };
-  const mOuter = raster(outerLoop), mInner = raster(innerLoop);
+  const mUpper = raster(parts.upper), mLower = raster(parts.lower), mOuter = raster(parts.outer);
 
-  // 4) same-frame pixels, then the final mask: edge snapped to the real lip border + depth-aware fade
+  // 4) same-frame pixels, then the final masks: each lip's edge snapped to the real lip border + depth-aware fade
   roiX.drawImage(video, x0, y0, w, h, 0, 0, w, h);
   const img = roiX.getImageData(0, 0, w, h);
-  const mask = LipFX.finishMask(mOuter, mInner, img.data, w, h,
+  const m = LipFX.finishMasks(mUpper, mLower, mOuter, img.data, w, h,
     { lipW, refine: REFINE_EDGES, band: REFINE_BAND, fit: LipFX.fitSurface(P, lipW), ox: x0, oy: y0 });
 
-  // 5) colour + finish
-  LipFX.render(img.data, w, h, mask, { color, alpha: ALPHA, finish: finish(), lipW, noise, ox: x0, oy: y0, state: fxState });
+  // 5) colour + finish (m.mask = both lips; m.upper / m.lower are the separate masks)
+  LipFX.render(img.data, w, h, m.mask, { color, alpha: ALPHA, finish: finish(), lipW, noise, ox: x0, oy: y0, state: fxState, upper: m.upper, lower: m.lower });
   roiX.putImageData(img, 0, 0);
   vctx.drawImage(roiC, x0, y0);
 }

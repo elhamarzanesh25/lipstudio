@@ -13,11 +13,15 @@
   // A real colour mix (not just the alpha compositing in render()), so the lipstick's hue is
   // already warmed/cooled by the person's own pigment before it touches the video frame.
   const LIP_MIX = 0.7;
-  // How strongly the LIP'S OWN TEXTURE (not the room's lighting - see shade() below) lightens a
-  // naturally-raised/highlighted spot, and darkens a naturally-recessed one, for each finish.
-  const TONE = { matte: [0.35, 0.35], satin: [0.50, 0.30], glossy: [0.65, 0.25], velvet: [0.25, 0.45] };
-  // Glossy only: extra whitening on the very brightest texture ridges - the "wet" specular look.
+  // Lip brightness -> paint brightness.  For every lip pixel:  shade = its own luma / the lip's typical (median) luma.
+  //   shade < 1 (recess, crease, shadow) -> (1 - shade) x gain of BLACK is mixed into the paint  (same percentage)
+  //   shade > 1 (raised, lit)            -> (shade - 1) x gain of WHITE is mixed into the paint
+  // TONE = [light gain, dark gain] per finish; 1.0 = exactly the measured percentage, >1 = exaggerate.
+  const TONE = { matte: [1.0, 1.0], satin: [1.15, 1.0], glossy: [1.4, 0.9] };
+  // Glossy only: extra whitening on the very brightest spots - the "wet" specular look.
   const GLOSSY_SPECULAR = 0.35;
+  // Blur (px) used to read the lip's brightness: just enough to ignore sensor noise, small enough to keep the creases.
+  const SHADE_BLUR = 0.8;
 
   // ---------- Gaussian blur (3 box passes, edge-replicated) ----------
   function boxesForGauss(sigma, n) {
@@ -133,6 +137,37 @@
     return upper.concat(lower.slice(1));
   }
 
+    // ---------- Upper / lower lip as two SEPARATE polygons ----------
+  // Inner-contour points k (upper, 1..9) and 20-k (lower) face each other across the mouth opening.
+  // When they (almost) touch, both are pulled onto their mid-line, so the two lips meet with no hairline gap;
+  // as the mouth opens they separate smoothly (no popping).  Works on x/y only.
+  function closeSeam(Pi, lipW) {
+    const Q = Pi.map(p => [p[0], p[1]]), lo = 0.015 * lipW, hi = 0.05 * lipW;
+    for (let k = 1; k <= 9; k++) {
+      const a = Q[k], b = Q[20 - k];
+      const t = 1 - smoothstep(lo, hi, Math.hypot(b[0] - a[0], b[1] - a[1]));
+      const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+      Q[k] = [a[0] + (mx - a[0]) * t, a[1] + (my - a[1]) * t];
+      Q[20 - k] = [b[0] + (mx - b[0]) * t, b[1] + (my - b[1]) * t];
+    }
+    return Q;
+  }
+  /**
+   * Po / Pi: the 20 outer / 20 inner contour points (same order as OUTER / INNER in live.js).
+   * Returns closed polylines: upper (upper lip only), lower (lower lip only), outer (whole outer outline).
+   * upper = outer upper edge + inner upper edge reversed;  lower = outer lower edge + inner lower edge reversed.
+   */
+  function lipParts(Po, Pi, lipW, seg = 6) {
+    const Qi = closeSeam(Pi, lipW);
+    const chains = P => ({ up: curveChain(P.slice(0, 11), seg), lo: curveChain(P.slice(10).concat([P[0]]), seg) });
+    const o = chains(Po), i = chains(Qi);
+    return {
+      upper: o.up.concat(i.up.slice().reverse()),
+      lower: o.lo.concat(i.lo.slice().reverse()),
+      outer: lipLoop(Po, seg),
+    };
+  }
+
   // ---------- 3D depth of the lip region: quadratic surface fitted to the landmarks' z ----------
   function solve(A, b) {
     const n = b.length;
@@ -163,54 +198,80 @@
     return 1 / Math.sqrt(1 + gx * gx + gy * gy);
   }
 
-  // ---------- Final lip mask: snap to the real lip border, feather, fade at grazing angles ----------
+    // ---------- Final lip masks: one per lip, each snapped to the real lip border, feathered, faded at grazing angles ----------
   /**
-   * mOuter / mInner: anti-aliased fills of the outer lip outline and of the mouth opening (Float32, 0..1).
-   * o: { lipW, refine (default true), band (max edge move, fraction of lip width, default 0.05), fit, ox, oy }  ->  Float32Array mask
+   * mU / mL: anti-aliased fills of the UPPER and LOWER lip polygons (lipParts().upper / .lower).
+   * mOuter:  anti-aliased fill of the whole outer outline (includes the mouth opening).
+   * o: { lipW, refine (default true), band (max edge move, fraction of lip width, default 0.05), fit, ox, oy }
+   * -> { upper, lower, mask }  (Float32Array 0..1 each; mask = upper + lower, i.e. both lips together)
+   *
+   * Each lip is refined on its own: its own "sure lip" and "skin" colour statistics, its own edges.
+   *  - outer edge: may grow / shrink by up to `band` towards the real lip/skin border (growing needs stronger evidence)
+   *  - inner edge (towards the mouth opening): may only shrink, so paint never lands on teeth / tongue / dark mouth;
+   *    right at the seam where the lips touch nothing is trimmed, so the lips stay fully covered there.
    */
-  function finishMask(mOuter, mInner, rgba, w, h, o) {
+  function finishMasks(mU, mL, mOuter, rgba, w, h, o) {
     const n = w * h, lipW = o.lipW;
-    let outer = mOuter;
+    const hardU = new Uint8Array(n), hardL = new Uint8Array(n), hardO = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      hardU[i] = mU[i] > 0.5 ? 1 : 0; hardL[i] = mL[i] > 0.5 ? 1 : 0;
+      hardO[i] = mOuter[i] > 0.5 || hardU[i] || hardL[i] ? 1 : 0;
+    }
+    let rU = mU, rL = mL;
     if (o.refine !== false) {
-      const hardO = new Uint8Array(n), inv = new Uint8Array(n), hardG = new Uint8Array(n);
-      for (let i = 0; i < n; i++) { const ho = mOuter[i] > 0.5 ? 1 : 0; hardO[i] = ho; inv[i] = 1 - ho; hardG[i] = ho && mInner[i] < 0.5 ? 1 : 0; }
-      const dIn = chamfer(hardO, w, h, 0), dOut = chamfer(inv, w, h, 1e9), dGeo = chamfer(hardG, w, h, 0);
-      const delta = Math.max(2, (o.band ?? 0.05) * lipW), coreD = Math.max(2, 0.05 * lipW), ring = 0.15 * lipW;
-      const f0 = new Float32Array(n);                                      // red chroma (Cr): lips > skin
+      const inv = a => { const o = new Uint8Array(n); for (let i = 0; i < n; i++) o[i] = 1 - a[i]; return o; };   // (a plain loop: ~30x faster than Uint8Array.from(a, fn))
+      const dOut = chamfer(inv(hardO), w, h, 1e9);                        // skin pixel -> nearest lip/mouth pixel
+      const dInU = chamfer(hardU, w, h, 0), dInL = chamfer(hardL, w, h, 0);   // lip pixel -> its own border
+      const dToU = chamfer(inv(hardU), w, h, 1e9), dToL = chamfer(inv(hardL), w, h, 1e9);   // any pixel -> that lip
+      const delta = Math.max(2, (o.band ?? 0.05) * lipW), coreD = Math.max(1.5, 0.035 * lipW), ring = 0.15 * lipW;
+      const f0 = new Float32Array(n);                                      // red chroma (Cr): lips > skin > teeth
       for (let i = 0; i < n; i++) f0[i] = 0.5 * rgba[4 * i] - 0.4187 * rgba[4 * i + 1] - 0.0813 * rgba[4 * i + 2];
       const f = gauss(f0, w, h, 1.0);
-      let s1 = 0, q1 = 0, n1 = 0, s2 = 0, q2 = 0, n2 = 0;
-      for (let i = 0; i < n; i++) {
-        if (dGeo[i] > coreD && dIn[i] > delta) { s1 += f[i]; q1 += f[i] * f[i]; n1++; }                       // sure lip
-        else if (!hardO[i] && dOut[i] > delta && dOut[i] < delta + ring) { s2 += f[i]; q2 += f[i] * f[i]; n2++; } // skin ring
-      }
-      if (n1 > 30 && n2 > 30) {
+
+      const refine = (m, hard, dIn, dSelf, dOther) => {
+        let s1 = 0, q1 = 0, n1 = 0, s2 = 0, q2 = 0, n2 = 0;
+        for (let i = 0; i < n; i++) {
+          if (hard[i] && dIn[i] > coreD) { s1 += f[i]; q1 += f[i] * f[i]; n1++; }                    // sure lip (this lip)
+          else if (!hardO[i] && dOut[i] > delta && dOut[i] < delta + ring && dSelf[i] <= dOther[i]) { s2 += f[i]; q2 += f[i] * f[i]; n2++; }   // skin next to THIS lip
+        }
+        if (n1 <= 30 || n2 <= 30) return m;
         const mu1 = s1 / n1, mu2 = s2 / n2, sd = Math.sqrt(Math.max(((q1 / n1 - mu1 * mu1) + (q2 / n2 - mu2 * mu2)) / 2, 1e-3));
         const dl = mu1 - mu2;
         // confidence: how well red chroma separates lip from skin in THIS frame (0 = don't touch the geometry)
         const conf = dl < 4 ? 0 : clamp((dl / sd - 0.8) / 1.2, 0, 1);
-        if (conf > 0) {
-          outer = new Float32Array(n);
-          for (let i = 0; i < n; i++) {
-            const grow = !hardO[i];                                        // turning a SKIN pixel into lip
-            const a = grow ? dOut[i] : dIn[i];                              // distance to the geometric border
-            if (a >= delta) { outer[i] = mOuter[i]; continue; }
+        if (conf <= 0) return m;
+        const out = new Float32Array(n);
+        for (let i = 0; i < n; i++) {
+          let a, k, p;
+          if (hard[i]) {                                                    // inside this lip: may be trimmed (skin / teeth / mouth)
+            a = dIn[i];
+            if (a >= delta) { out[i] = m[i]; continue; }
+            p = smoothstep(0.15, 0.5, (f[i] - mu2) / dl);
+            k = conf * (1 - smoothstep(0.55 * delta, delta, a)) * smoothstep(1.5, 3.5, dOther[i]);   // 0 at the seam
+          } else {                                                          // outside: only SKIN next to this lip may become lip
+            if (hardO[i] || dSelf[i] >= delta || dSelf[i] > dOther[i]) { out[i] = m[i]; continue; }
+            a = dSelf[i];
             // Asymmetric on purpose: bleeding lipstick onto skin (growing) is far more visible than
             // trimming a pixel of lip back to skin (shrinking), so growing needs much stronger evidence.
-            const p = grow ? smoothstep(0.55, 0.9, (f[i] - mu2) / dl) : smoothstep(0.15, 0.5, (f[i] - mu2) / dl);
-            const k = (grow ? conf * 0.6 : conf) * (1 - smoothstep(0.55 * delta, delta, a));   // fades to 0 at the band edge
-            outer[i] = mOuter[i] * (1 - k) + p * k;
+            p = smoothstep(0.55, 0.9, (f[i] - mu2) / dl);
+            k = conf * 0.6 * (1 - smoothstep(0.55 * delta, delta, a));
           }
+          out[i] = m[i] * (1 - k) + p * k;
         }
+        return out;
+      };
+      rU = refine(mU, hardU, dInU, dToU, dToL);
+      rL = refine(mL, hardL, dInL, dToL, dToU);
+    }
+    const sig = Math.max(1, lipW * 0.02), upper = gauss(rU, w, h, sig), lower = gauss(rL, w, h, sig), mask = new Float32Array(n);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (o.fit && (upper[i] > 0 || lower[i] > 0)) {                        // depth-aware fade at grazing angles
+        const g = smoothstep(0.25, 0.5, facingAt(o.fit, x + o.ox, y + o.oy)); upper[i] *= g; lower[i] *= g;
       }
+      mask[i] = Math.min(1, upper[i] + lower[i]);                            // the two lips share the seam: sum, don't max
     }
-    const m0 = new Float32Array(n);
-    for (let i = 0; i < n; i++) m0[i] = outer[i] * (1 - mInner[i]);
-    const m = gauss(m0, w, h, Math.max(1, lipW * 0.02));
-    if (o.fit) for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {   // depth-aware fade at grazing angles
-      const i = y * w + x; if (m[i] > 0) m[i] *= smoothstep(0.25, 0.5, facingAt(o.fit, x + o.ox, y + o.oy));
-    }
-    return m;
+    return { upper, lower, mask };
   }
 
   // ---------- Main entry ----------
@@ -242,25 +303,39 @@
       return p;
     };
     const addWhite = (p, map) => { for (let i = 0; i < n; i++) { const v = 255 * map[i]; p.r[i] += v; p.g[i] += v; p.b[i] += v; } return p; };
-    let depth = null; const getDepth = () => depth || (depth = distanceMap(mask, w, h));
+        // "Depth" (0 at a lip's edge -> 1 at its centre).  Each lip is its own volume, so with the two masks it is measured
+    // per lip: the seam between the lips counts as an edge, and an open mouth gets edges on both lips.
+    let depth = null;
+    const getDepth = () => {
+      if (depth) return depth;
+      if (!o.upper || !o.lower) return (depth = distanceMap(mask, w, h));
+      const dU = distanceMap(o.upper, w, h), dL = distanceMap(o.lower, w, h);
+      depth = new Float32Array(n);
+      for (let i = 0; i < n; i++) depth[i] = o.upper[i] >= o.lower[i] ? dU[i] : dL[i];
+      return depth;
+    };
     const band = (c, wd) => { const d = getDepth(), out = new Float32Array(n);
       for (let i = 0; i < n; i++) { const t = (d[i] - c) / wd; out[i] = Math.exp(-t * t) * mask[i]; } return out; };
 
-    // Local texture lightness (~0.6 recess .. 1.0 neutral .. 1.4 highlight ridge): a small blur of the
-    // lips' own luma divided by a WIDER blur of the same pixels.  A slow, room-wide lighting gradient
-    // shows up almost identically in both blurs and cancels out of the ratio; what survives is texture
-    // that changes over a shorter distance than the wide blur - the vermillion border, the cupid's bow,
-    // the seam, the corners.  That is "the brightness of the lip's own texture", not the room's light.
-    const s1 = 0.8, s2 = Math.max(2, lipW * 0.06), Lm = new Float32Array(n);
+        // Brightness of the lip's own surface relative to the lip's typical brightness.
+    //   shade = (this pixel's luma, lightly blurred against sensor noise) / (median luma of all lip pixels)
+    //   1.0 = typical, 0.7 = 30 % darker (a recess: crease, seam, corner, shadow), 1.3 = 30 % brighter (raised / lit).
+    // tLo = how much darker (0..1) -> that same fraction of BLACK is added to the paint there.
+    // tHi = how much brighter (0..1) -> the paint is lightened by that fraction towards white there.
+    // The reference is the lip's own median (temporally smoothed), so the overall exposure of the camera cancels out,
+    // while lighting that differs ACROSS the lips (lit lower lip vs shadowed upper lip) is kept, as on a real lip.
+    const Lm = new Float32Array(n);
     for (let i = 0; i < n; i++) Lm[i] = L[i] * mask[i];
-    const a1 = gauss(Lm, w, h, s1), b1 = gauss(mask, w, h, s1), a2 = gauss(Lm, w, h, s2), b2 = gauss(mask, w, h, s2);
+    const aF = gauss(Lm, w, h, SHADE_BLUR), bF = gauss(mask, w, h, SHADE_BLUR), Ls = new Float32Array(n);
+    for (let i = 0; i < n; i++) Ls[i] = aF[i] / Math.max(bF[i], 1e-3);        // mask-weighted: skin / mouth never leak in
+    let ref = percentiles(Ls, mask, [50])[0];
+    if (o.state) { const p = o.state.ref; if (p !== undefined) ref = p + 0.2 * (ref - p); o.state.ref = ref; }
+    ref = Math.max(ref, 0.05);
     const tHi = new Float32Array(n), tLo = new Float32Array(n);         // highlight / recess amounts, 0..1
     for (let i = 0; i < n; i++) {
-      const fine = a1[i] / Math.max(b1[i], 1e-3), mid = a2[i] / Math.max(b2[i], 1e-3);
-      let sh = clamp(fine / Math.max(mid, 0.05), 0.6, 1.4);
-      const conf = smoothstep(0.05, 0.3, b2[i]);                        // fade to neutral at the mask edge
-      sh = 1 + (sh - 1) * conf;
-      tHi[i] = clamp((sh - 1) / 0.4, 0, 1); tLo[i] = clamp((1 - sh) / 0.4, 0, 1);
+      if (mask[i] <= 0) continue;
+      const shade = Ls[i] / ref, conf = smoothstep(0.02, 0.3, bF[i]);    // conf: only the outermost anti-aliased fringe stays neutral
+      tHi[i] = clamp(shade - 1, 0, 1) * conf; tLo[i] = clamp(1 - shade, 0, 1) * conf;
     }
 
     // Paint the lips at a constant opacity everywhere, but let the texture above brighten/darken the
@@ -269,9 +344,11 @@
       const out = planes(new Float32Array(n), new Float32Array(n), new Float32Array(n));
       for (let i = 0; i < n; i++) {
         const wt = mask[i] * A;
-        let tr = cr + tHi[i] * lightGain * (255 - cr), tg = cg + tHi[i] * lightGain * (255 - cg), tb = cb + tHi[i] * lightGain * (255 - cb);
+        const lt = Math.min(1, tHi[i] * lightGain);                       // lighter spot -> lighter lipstick (towards white)
+        let tr = cr + lt * (255 - cr), tg = cg + lt * (255 - cg), tb = cb + lt * (255 - cb);
         if (specGain) { const s = tHi[i] * tHi[i] * specGain; tr += s * (255 - tr); tg += s * (255 - tg); tb += s * (255 - tb); }
-        const k = 1 - tLo[i] * darkGain; tr *= k; tg *= k; tb *= k;
+        const k = 1 - Math.min(0.92, tLo[i] * darkGain);                  // recess -> same percentage of black added to the lipstick
+        tr *= k; tg *= k; tb *= k;
         out.r[i] = R[i] * (1 - wt) + tr * wt; out.g[i] = G[i] * (1 - wt) + tg * wt; out.b[i] = B[i] * (1 - wt) + tb * wt;
       }
       return out;
@@ -282,16 +359,6 @@
         out = soften(tinted(...TONE.glossy, GLOSSY_SPECULAR), 0.35); break;
       case 'satin':
         out = soften(tinted(...TONE.satin), 0.2); break;
-      case 'velvet': {
-        out = soften(tinted(...TONE.velvet), 0.5);
-        const nz = o.noise, d = getDepth();
-        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = y * w + x;
-          const g = nz ? nz.tile[(((y + o.oy) % nz.size + nz.size) % nz.size) * nz.size + (((x + o.ox) % nz.size + nz.size) % nz.size)] * mask[i] : 0;
-          const e = (1 - d[i]) * (1 - d[i]), k = 1 - 0.18 * e * mask[i];
-          out.r[i] = (out.r[i] + g) * k; out.g[i] = (out.g[i] + g) * k; out.b[i] = (out.b[i] + g) * k; }
-        const bd = band(0.6, 0.3); for (let i = 0; i < n; i++) bd[i] *= 0.05;
-        out = addWhite(out, bd); break;
-      }
       default: out = tinted(...TONE.matte);
     }
     for (let i = 0; i < n; i++) if (mask[i] > 0) {         // only touch lip pixels
@@ -299,6 +366,6 @@
     }
   }
 
-  const api = { render, gauss, makeNoise, OneEuro, curveChain, lipLoop, fitSurface, facingAt, finishMask };
+  const api = { render, gauss, makeNoise, OneEuro, curveChain, lipLoop, lipParts, fitSurface, facingAt, finishMasks };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.LipFX = api;
 })(typeof self !== 'undefined' ? self : this);
